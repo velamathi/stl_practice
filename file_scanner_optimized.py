@@ -107,6 +107,20 @@ class ChunkedWriter:
         self.chunks_dir = output_dir / "chunks"
         self.chunks_dir.mkdir(exist_ok=True)
         
+    def clean_dict_values(self, d: Dict) -> Dict:
+        """Clean dictionary values to handle Unicode errors"""
+        cleaned = {}
+        for k, v in d.items():
+            if isinstance(v, str):
+                try:
+                    # Replace invalid characters with '?'
+                    cleaned[k] = v.encode('utf-8', errors='replace').decode('utf-8')
+                except UnicodeError:
+                    cleaned[k] = '?'  # Fallback for completely invalid strings
+            else:
+                cleaned[k] = v
+        return cleaned
+        
     def write_chunk(self, chunk: List[Dict], chunk_num: int):
         """Write a chunk of data to CSV"""
         if not chunk:
@@ -116,10 +130,40 @@ class ChunkedWriter:
         # Update fieldnames with new fields from current chunk
         self.fieldnames.update(*(d.keys() for d in chunk))
         
-        with open(chunk_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=sorted(self.fieldnames))
-            writer.writeheader()
-            writer.writerows(chunk)
+        try:
+            with open(chunk_file, 'w', newline='', encoding='utf-8', errors='replace') as f:
+                writer = csv.DictWriter(f, fieldnames=sorted(self.fieldnames))
+                writer.writeheader()
+                # Clean and write each row
+                for row in chunk:
+                    cleaned_row = self.clean_dict_values(row)
+                    try:
+                        writer.writerow(cleaned_row)
+                    except UnicodeError as e:
+                        logging.warning(f"Unicode error while writing row: {e}")
+                        # Try again with more aggressive cleaning
+                        ultra_clean = {k: str(v).encode('ascii', 'replace').decode('ascii') 
+                                     if isinstance(v, str) else v 
+                                     for k, v in cleaned_row.items()}
+                        writer.writerow(ultra_clean)
+        except Exception as e:
+            logging.error(f"Error writing chunk {chunk_num}: {e}")
+            # Create a backup with minimal information
+            self._write_backup_chunk(chunk, chunk_num)
+    
+    def _write_backup_chunk(self, chunk: List[Dict], chunk_num: int):
+        """Write a backup chunk with minimal information if normal write fails"""
+        backup_file = self.chunks_dir / f"chunk_{chunk_num}_backup.csv"
+        minimal_fields = {'filename', 'size_bytes', 'modified_time'}
+        try:
+            with open(backup_file, 'w', newline='', encoding='ascii', errors='replace') as f:
+                writer = csv.DictWriter(f, fieldnames=sorted(minimal_fields))
+                writer.writeheader()
+                for row in chunk:
+                    minimal_row = {k: row.get(k, '') for k in minimal_fields}
+                    writer.writerow(minimal_row)
+        except Exception as e:
+            logging.error(f"Failed to write backup chunk: {e}")
     
     def add_result(self, result: Dict):
         """Add a result to the current chunk"""
@@ -143,25 +187,33 @@ class ChunkedWriter:
         if not self.fieldnames:
             return
             
-        # Write the final CSV file with all fields
-        with open(self.final_csv, 'w', newline='', encoding='utf-8') as final_file:
-            writer = csv.DictWriter(final_file, fieldnames=sorted(self.fieldnames))
-            writer.writeheader()
-            
-            # Process each chunk
-            chunk_files = sorted(self.chunks_dir.glob("chunk_*.csv"))
-            for chunk_file in chunk_files:
-                with open(chunk_file, 'r', newline='', encoding='utf-8') as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        writer.writerow(row)
+        try:
+            # Write the final CSV file with all fields
+            with open(self.final_csv, 'w', newline='', encoding='utf-8', errors='replace') as final_file:
+                writer = csv.DictWriter(final_file, fieldnames=sorted(self.fieldnames))
+                writer.writeheader()
                 
-                # Remove processed chunk
-                chunk_file.unlink()
-            
-        # Remove chunks directory if empty
-        if self.chunks_dir.exists():
-            self.chunks_dir.rmdir()
+                # Process each chunk
+                chunk_files = sorted(self.chunks_dir.glob("chunk_*.csv"))
+                for chunk_file in chunk_files:
+                    try:
+                        with open(chunk_file, 'r', newline='', encoding='utf-8', errors='replace') as f:
+                            reader = csv.DictReader(f)
+                            for row in reader:
+                                cleaned_row = self.clean_dict_values(row)
+                                writer.writerow(cleaned_row)
+                    except Exception as e:
+                        logging.error(f"Error processing chunk {chunk_file}: {e}")
+                    finally:
+                        # Remove processed chunk
+                        chunk_file.unlink()
+                
+            # Remove chunks directory if empty
+            if self.chunks_dir.exists():
+                self.chunks_dir.rmdir()
+        except Exception as e:
+            logging.error(f"Error merging chunks: {e}")
+            print("\nError merging chunks. Check the individual chunk files in the 'chunks' directory.")
 
 class MassiveTreeWalker:
     """Memory-efficient massive tree traversal"""
