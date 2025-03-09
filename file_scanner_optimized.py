@@ -27,6 +27,11 @@ from functools import partial
 from tqdm import tqdm
 import sys
 import shutil
+import stat
+import pwd
+import grp
+import mimetypes
+import magic  # You'll need to install python-magic: pip install python-magic
 
 # Global counters for progress tracking
 file_counter = Value('i', 0)
@@ -395,7 +400,7 @@ class ProgressDisplay:
         print("=" * width + "\n")
 
 def process_file(path: str, root_path: str, progress: ProgressDisplay) -> Optional[Dict[str, Any]]:
-    """Process a single file with progress tracking"""
+    """Process a single file with enhanced metadata collection"""
     try:
         is_symlink = os.path.islink(path)
         is_broken_link = False
@@ -416,24 +421,108 @@ def process_file(path: str, root_path: str, progress: ProgressDisplay) -> Option
                 with progress.stats.broken_links.get_lock():
                     progress.stats.broken_links.value += 1
         
+        # Get detailed file stats
         stats = os.lstat(path)
         relative_path = str(Path(path).relative_to(root_path))
         
+        # Calculate file hash for small files (< 100MB)
+        file_hash = None
+        if not is_symlink and stats.st_size < 100_000_000:  # 100MB limit
+            try:
+                with open(path, 'rb') as f:
+                    file_hash = hashlib.md5(f.read()).hexdigest()
+            except (OSError, PermissionError):
+                pass
+        
+        # Get mime type using python-magic if available
+        mime_type = None
+        try:
+            mime_type = magic.from_file(path, mime=True)
+        except ImportError:
+            # Fallback to basic extension check
+            mime_type = mimetypes.guess_type(path)[0]
+        
+        # Get owner and group information
+        try:
+            owner = pwd.getpwuid(stats.st_uid).pw_name
+        except KeyError:
+            owner = str(stats.st_uid)
+        try:
+            group = grp.getgrgid(stats.st_gid).gr_name
+        except KeyError:
+            group = str(stats.st_gid)
+        
+        # Detailed permission analysis
+        mode = stats.st_mode
+        permissions = {
+            'user_read': bool(mode & stat.S_IRUSR),
+            'user_write': bool(mode & stat.S_IWUSR),
+            'user_exec': bool(mode & stat.S_IXUSR),
+            'group_read': bool(mode & stat.S_IRGRP),
+            'group_write': bool(mode & stat.S_IWGRP),
+            'group_exec': bool(mode & stat.S_IXGRP),
+            'other_read': bool(mode & stat.S_IROTH),
+            'other_write': bool(mode & stat.S_IWOTH),
+            'other_exec': bool(mode & stat.S_IXOTH),
+            'sticky': bool(mode & stat.S_ISVTX),
+            'setuid': bool(mode & stat.S_ISUID),
+            'setgid': bool(mode & stat.S_ISGID),
+        }
+        
         file_info = {
+            # Basic information
             'filename': os.path.basename(path),
             'path': path,
             'relative_path': relative_path,
+            
+            # Size information
             'size_bytes': stats.st_size,
             'size_human': format_size(stats.st_size),
+            'blocks_allocated': stats.st_blocks,
+            'block_size': stats.st_blksize if hasattr(stats, 'st_blksize') else None,
+            
+            # Time information
             'modified_time': datetime.fromtimestamp(stats.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+            'access_time': datetime.fromtimestamp(stats.st_atime).strftime('%Y-%m-%d %H:%M:%S'),
+            'creation_time': datetime.fromtimestamp(stats.st_ctime).strftime('%Y-%m-%d %H:%M:%S'),
+            
+            # File type and format
             'file_extension': os.path.splitext(path)[1].lower(),
+            'mime_type': mime_type,
+            'file_type': stat.S_IFMT(mode),
+            'is_file': stat.S_ISREG(mode),
+            'is_dir': stat.S_ISDIR(mode),
+            'is_char_device': stat.S_ISCHR(mode),
+            'is_block_device': stat.S_ISBLK(mode),
+            'is_fifo': stat.S_ISFIFO(mode),
+            'is_socket': stat.S_ISSOCK(mode),
+            
+            # Path information
             'directory_depth': relative_path.count(os.sep),
             'full_directory_path': os.path.dirname(path),
-            'permissions': oct(stats.st_mode)[-3:],
-            'is_readable': os.access(path, os.R_OK),
+            'parent_dir': os.path.basename(os.path.dirname(path)),
+            
+            # Ownership and permissions
+            'owner_name': owner,
+            'group_name': group,
+            'owner_id': stats.st_uid,
+            'group_id': stats.st_gid,
+            'mode_octal': oct(mode)[-4:],
+            'permissions': permissions,
+            
+            # Link information
             'is_symlink': is_symlink,
             'is_broken_link': is_broken_link,
-            'link_target': link_target if is_symlink else None
+            'link_target': link_target,
+            
+            # File identification
+            'inode': stats.st_ino,
+            'device_id': stats.st_dev,
+            'hard_links': stats.st_nlink,
+            'file_hash': file_hash,
+            
+            # Scan metadata
+            'scan_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
         
         # Update size statistics
@@ -444,6 +533,7 @@ def process_file(path: str, root_path: str, progress: ProgressDisplay) -> Option
     except Exception as e:
         with progress.stats.errors.get_lock():
             progress.stats.errors.value += 1
+        logging.error(f"Error processing file {path}: {str(e)}")
         return None
 
 def process_batch(batch: List[str], root_path: str, num_threads: int, progress: ProgressDisplay) -> List[Dict]:
